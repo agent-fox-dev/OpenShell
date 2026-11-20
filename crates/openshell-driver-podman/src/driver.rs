@@ -440,9 +440,10 @@ pub fn detect_socket() -> Option<PathBuf> {
     crate::socket_discovery::detect_socket()
 }
 
+/// Return whether a local Podman API socket answers, for gateway auto-detection.
 #[must_use]
 pub fn is_available() -> bool {
-    detect_socket().is_some()
+    crate::socket_discovery::detect_responsive_socket().is_some()
 }
 
 /// Resolve the socket to connect to: explicit configuration wins, otherwise

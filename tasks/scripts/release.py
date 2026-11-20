@@ -469,6 +469,9 @@ class Openshell < Formula
 
   service do
     run opt_libexec/"openshell-gateway-homebrew-service"
+    # launchd starts services with only the system PATH. Compute driver
+    # auto-detection runs container CLIs such as podman from Homebrew.
+    environment_variables PATH: std_service_path_env
     keep_alive successful_exit: false
     log_path var/"log/openshell/openshell-gateway.out.log"
     error_log_path var/"log/openshell/openshell-gateway.err.log"

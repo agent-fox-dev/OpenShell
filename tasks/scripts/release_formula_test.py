@@ -107,6 +107,7 @@ def test_generate_homebrew_formula_uses_channel_urls_and_exact_version(
         in formula
     )
     assert 'run opt_libexec/"openshell-gateway-homebrew-service"' in formula
+    assert "environment_variables PATH: std_service_path_env" in formula
     assert 'xdg_config_home="${XDG_CONFIG_HOME:-${HOME}/.config}"' in formula
     assert 'xdg_gateway_config="${xdg_config_home}/openshell/gateway.toml"' in formula
     assert 'prefix_gateway_config="#{var}/openshell/gateway.toml"' in formula

@@ -3,7 +3,7 @@
 
 //! Podman socket discovery for local and machine-backed installations.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -13,11 +13,26 @@ const DISCOVERY_POLL_INTERVAL: Duration = Duration::from_millis(25);
 /// Return the first responsive well-known socket, then ask the Podman CLI for
 /// the active native or machine-backed connection.
 pub fn detect_socket() -> Option<PathBuf> {
-    openshell_core::local_api_socket::first_responsive_socket(&socket_candidates(), |response| {
+    first_responsive_libpod_socket(&socket_candidates()).or_else(discover_socket)
+}
+
+/// Like [`detect_socket`], but only accept a CLI-reported socket that answers
+/// the Libpod API. A stopped Podman machine still reports its socket path, and
+/// auto-detection must not select Podman for it.
+pub fn detect_responsive_socket() -> Option<PathBuf> {
+    first_responsive_libpod_socket(&socket_candidates())
+        .or_else(|| discover_socket().filter(|path| libpod_socket_responds(path)))
+}
+
+fn first_responsive_libpod_socket(candidates: &[PathBuf]) -> Option<PathBuf> {
+    openshell_core::local_api_socket::first_responsive_socket(candidates, |response| {
         openshell_core::local_api_socket::http_response_is_success(response)
             && openshell_core::local_api_socket::contains_ascii(response, b"Libpod-Api-Version:")
     })
-    .or_else(discover_socket)
+}
+
+fn libpod_socket_responds(path: &Path) -> bool {
+    first_responsive_libpod_socket(&[path.to_path_buf()]).is_some()
 }
 
 fn socket_candidates() -> Vec<PathBuf> {
@@ -37,7 +52,35 @@ fn socket_candidates() -> Vec<PathBuf> {
         candidates
             .push(PathBuf::from(home).join(".local/share/containers/podman/machine/podman.sock"));
     }
+    // Podman 5+ on macOS places the default machine's API socket in the
+    // per-user temporary directory.
+    #[cfg(target_os = "macos")]
+    if let Some(temp_dir) = user_temp_dir() {
+        candidates.push(temp_dir.join("podman/podman-machine-default-api.sock"));
+    }
     candidates
+}
+
+/// Return the per-user temporary directory Podman uses on macOS. launchd
+/// services such as `brew services` start without `TMPDIR`, so fall back to the
+/// directory the system assigns to the user, which is what `TMPDIR` holds in a
+/// login session.
+#[cfg(target_os = "macos")]
+fn user_temp_dir() -> Option<PathBuf> {
+    static DARWIN_USER_TEMP_DIR: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+
+    env_var_nonempty("TMPDIR").map(PathBuf::from).or_else(|| {
+        DARWIN_USER_TEMP_DIR
+            .get_or_init(|| {
+                let mut command = Command::new("/usr/bin/getconf");
+                command.arg("DARWIN_USER_TEMP_DIR");
+                let stdout = run_bounded_command(command, DISCOVERY_TIMEOUT)?;
+                let path = String::from_utf8(stdout).ok()?;
+                let path = path.trim();
+                (!path.is_empty()).then(|| PathBuf::from(path))
+            })
+            .clone()
+    })
 }
 
 /// Query the same active connection selected by the Podman CLI. This covers
@@ -158,18 +201,30 @@ fn env_var_nonempty(key: &str) -> Option<String> {
 }
 
 fn run_podman_capture(args: &[&str]) -> Option<Vec<u8>> {
-    run_bounded_command("podman", args, DISCOVERY_TIMEOUT)
+    run_bounded_command(podman_command(args), DISCOVERY_TIMEOUT)
+}
+
+fn podman_command(args: &[&str]) -> Command {
+    let mut command = Command::new("podman");
+    command.args(args);
+    // Podman on macOS derives machine socket paths from TMPDIR. Without it the
+    // CLI reports a path under /tmp that the running machine does not use.
+    #[cfg(target_os = "macos")]
+    if env_var_nonempty("TMPDIR").is_none()
+        && let Some(temp_dir) = user_temp_dir()
+    {
+        command.env("TMPDIR", temp_dir);
+    }
+    command
 }
 
 /// Capture stdout without allowing a stalled Podman machine, SSH transport, or
 /// descendant holding the stdout pipe open to block gateway startup forever.
-fn run_bounded_command(program: &str, args: &[&str], timeout: Duration) -> Option<Vec<u8>> {
+fn run_bounded_command(mut command: Command, timeout: Duration) -> Option<Vec<u8>> {
     use std::io::Read as _;
     use std::sync::mpsc;
 
-    let mut command = Command::new(program);
     command
-        .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
@@ -237,6 +292,85 @@ fn terminate_process_group(child: &mut std::process::Child) {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn run_program(program: &str, args: &[&str], timeout: Duration) -> Option<Vec<u8>> {
+        let mut command = Command::new(program);
+        command.args(args);
+        run_bounded_command(command, timeout)
+    }
+
+    /// Serve one HTTP response on a Unix socket for a single probe.
+    #[cfg(unix)]
+    fn serve_once(path: &Path, response: &'static [u8]) -> std::thread::JoinHandle<()> {
+        use std::io::{Read as _, Write as _};
+
+        let listener = std::os::unix::net::UnixListener::bind(path).unwrap();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 512];
+            let _ = stream.read(&mut request);
+            let _ = stream.write_all(response);
+        })
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn libpod_socket_probe_accepts_only_a_responsive_libpod_api() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let libpod = dir.path().join("libpod.sock");
+        let server = serve_once(
+            &libpod,
+            b"HTTP/1.1 200 OK\r\nApi-Version: 1.41\r\nLibpod-Api-Version: 5.0.0\r\n\r\nOK",
+        );
+        assert!(libpod_socket_responds(&libpod));
+        server.join().unwrap();
+
+        let docker = dir.path().join("docker.sock");
+        let server = serve_once(&docker, b"HTTP/1.1 200 OK\r\nApi-Version: 1.41\r\n\r\nOK");
+        assert!(!libpod_socket_responds(&docker));
+        server.join().unwrap();
+
+        assert!(!libpod_socket_responds(&dir.path().join("missing.sock")));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn socket_candidates_include_default_machine_socket_in_tmpdir() {
+        temp_env::with_var("TMPDIR", Some("/var/folders/ab/cd/T/"), || {
+            assert!(socket_candidates().contains(&PathBuf::from(
+                "/var/folders/ab/cd/T/podman/podman-machine-default-api.sock"
+            )));
+        });
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn user_temp_dir_falls_back_to_darwin_user_temp_dir_without_tmpdir() {
+        temp_env::with_var_unset("TMPDIR", || {
+            let temp_dir = user_temp_dir().expect("getconf reports DARWIN_USER_TEMP_DIR");
+            assert!(temp_dir.is_absolute());
+            assert!(temp_dir.is_dir());
+        });
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn podman_command_supplies_tmpdir_only_when_unset() {
+        let tmpdir_env = |command: &Command| {
+            command
+                .get_envs()
+                .find(|(key, _)| *key == "TMPDIR")
+                .and_then(|(_, value)| value.map(PathBuf::from))
+        };
+
+        temp_env::with_var_unset("TMPDIR", || {
+            assert_eq!(tmpdir_env(&podman_command(&["info"])), user_temp_dir());
+        });
+        temp_env::with_var("TMPDIR", Some("/var/folders/ab/cd/T/"), || {
+            assert_eq!(tmpdir_env(&podman_command(&["info"])), None);
+        });
+    }
 
     #[test]
     fn parse_info_socket_rejects_missing_or_empty_paths() {
@@ -334,7 +468,7 @@ mod tests {
     #[test]
     fn bounded_command_captures_stdout_on_success() {
         assert_eq!(
-            run_bounded_command("printf", &["hello"], Duration::from_secs(5)),
+            run_program("printf", &["hello"], Duration::from_secs(5)),
             Some(b"hello".to_vec())
         );
     }
@@ -342,12 +476,9 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn bounded_command_returns_none_on_nonzero_exit_or_missing_program() {
+        assert_eq!(run_program("false", &[], Duration::from_secs(5)), None);
         assert_eq!(
-            run_bounded_command("false", &[], Duration::from_secs(5)),
-            None
-        );
-        assert_eq!(
-            run_bounded_command(
+            run_program(
                 "openshell-nonexistent-binary-xyz",
                 &[],
                 Duration::from_secs(5),
@@ -360,7 +491,7 @@ mod tests {
     #[test]
     fn bounded_command_kills_child_that_exceeds_deadline() {
         let start = Instant::now();
-        let result = run_bounded_command("sleep", &["30"], Duration::from_millis(200));
+        let result = run_program("sleep", &["30"], Duration::from_millis(200));
         assert_eq!(result, None);
         assert!(
             start.elapsed() < Duration::from_secs(5),
@@ -372,7 +503,7 @@ mod tests {
     #[test]
     fn bounded_command_bounds_drain_when_in_group_descendant_holds_stdout() {
         let start = Instant::now();
-        let result = run_bounded_command(
+        let result = run_program(
             "sh",
             &["-c", "sleep 30 & echo done"],
             Duration::from_millis(300),
@@ -388,7 +519,7 @@ mod tests {
     #[test]
     fn bounded_command_bounds_drain_when_descendant_escapes_process_group() {
         let start = Instant::now();
-        let result = run_bounded_command(
+        let result = run_program(
             "bash",
             &["-c", "set -m; sleep 5 & echo done"],
             Duration::from_millis(300),
